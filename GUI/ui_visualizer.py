@@ -20,6 +20,13 @@ def load_eeg_data(vhdr_file):
     except Exception as e:
         raise RuntimeError(f"Error loading EEG data: {e}")
 
+# Function to extract theta activity (4-8 Hz) from EEG data
+def extract_theta_activity(data, sfreq):
+    theta_band = (4, 8)
+    filtered_data = mne.filter.filter_data(data, sfreq, theta_band[0], theta_band[1])
+    theta_power = np.mean(np.abs(filtered_data) ** 2, axis=0)
+    return theta_power
+
 # Define the path to your files
 vhdr_file = '/Users/Shared/Het/Masters_Magdeburg/Research Student LIN/Work/Artifact Detection/ArtifactData/artifacts_pj63.vhdr'
 try:
@@ -30,38 +37,57 @@ except Exception as e:
 
 # Apply a bandpass filter to the data
 raw.filter(1.0, 40.0)
+sfreq = raw.info['sfreq']
 
-# Define a dictionary mapping trigger values to thresholds
-trigger_thresholds = {
-    1: 0.0007,  # rest with eyes open
-    2: 0.0008,  # rest with eyes closed
-    3: 0.0009,  # blink once per second
-    4: 0.0010,  # blink fast
-    5: 0.0011,  # move eyes left and right, once per second
-    6: 0.0012,  # move eyes up and down, once per second
-    7: 0.0013,  # clench teeth
-    8: 0.0014,  # move head in a 1sec pace
-    9: 0.0015,  # speak
-    10: 0.0016  # make a non-relaxed face
+# Define a dictionary mapping artifact ranges
+trigger_ranges = {
+    1: (0.0005, 0.0006),  # rest with eyes open
+    2: (0.0006, 0.0008),  # rest with eyes closed
+    3: (0.0008, 0.0012),  # blink once per second
+    4: (0.0012, 0.0016),  # blink fast
+    5: (0.0016, 0.0018),  # move eyes left and right, once per second
+    6: (0.0018, 0.0020),  # move eyes up and down, once per second
+    7: (0.0020, 0.0022),  # clench teeth
+    8: (0.0022, 0.0024),  # move head in a 1sec pace
+    9: (0.0024, 0.0026),  # speak
+    10: (0.0026, 0.0028)  # make a non-relaxed face
 }
+
+# Set the threshold for circle size scaling
+threshold = 0.0005
 
 # Initialize variables
 ptr = 0
 paused = False
 
-# Function to calculate baseline threshold
-def calculate_baseline_threshold(data, window_size):
-    thresholds = []
-    for channel in data:
-        baseline = np.mean(channel[:window_size])
-        std = np.std(channel[:window_size])
-        threshold = baseline + 2 * std
-        thresholds.append(threshold)
-    return np.array(thresholds)
+# Function to detect artifacts based on ranges and update circle size
+def detect_artifact_and_update(segment):
+    global trigger_ranges, feedback_canvas, feedback_circle
+
+    max_amplitude = np.max(np.abs(segment))
+    detected_artifact = None
+
+    for artifact, (low, high) in trigger_ranges.items():
+        if low <= max_amplitude < high:
+            detected_artifact = artifact
+            break
+
+    # Resize circle based on the maximum amplitude and threshold
+    scale_factor = max_amplitude / threshold
+    circle_size = max(50, min(200, 150 * scale_factor))
+    
+    if detected_artifact:
+        feedback_canvas.coords(feedback_circle, 150 - circle_size/2, 150 - circle_size/2, 150 + circle_size/2, 150 + circle_size/2)
+        feedback_canvas.itemconfig(feedback_circle, fill='red')
+    else:
+        feedback_canvas.coords(feedback_circle, 150 - circle_size/2, 150 - circle_size/2, 150 + circle_size/2, 150 + circle_size/2)
+        feedback_canvas.itemconfig(feedback_circle, fill='green')
+
+    return detected_artifact
 
 # Function to update the plot and feedback circle
 def update_plot(frame):
-    global ptr, data, times, raw, trigger_thresholds, paused
+    global ptr, data, times, raw, paused, sfreq
 
     if paused:
         return
@@ -74,23 +100,20 @@ def update_plot(frame):
         segment = data[:, start_idx:end_idx]
         time_segment = times[start_idx:end_idx] - times[0]
 
-        events, _ = mne.events_from_annotations(raw)
-        current_trigger = None
-        for event_time, _, trigger in events:
-            if start_idx <= event_time < end_idx:
-                current_trigger = trigger
-                break
+        # Detect artifact and update feedback
+        detected_artifact = detect_artifact_and_update(segment)
 
-        if current_trigger in trigger_thresholds:
-            threshold = trigger_thresholds[current_trigger]
-        else:
-            threshold = 0.0007
+        # Log the detected artifact
+        if detected_artifact:
+            feedback_log.insert(tk.END, f"Artifact {detected_artifact} detected at {time_segment[0]:.2f} s\n")
+            feedback_log.see(tk.END)  # Scroll to the latest log
 
-        artifact_detected = np.any(np.abs(segment) > threshold)
-        circle_color = 'red' if artifact_detected else 'green'
+        # Update the theta window
+        theta_activity = extract_theta_activity(segment, sfreq)
+        max_theta = np.max(theta_activity)
+        scaled_theta = max(0, min(1, max_theta / np.max(theta_activity)))
 
-        # Update the feedback window and log artifacts
-        update_feedback_window(segment, circle_color, time_segment, artifact_detected)
+        update_theta_window(scaled_theta, 'red' if detected_artifact else 'green', max_theta, theta_activity)
 
         ax.clear()
         for i in range(data.shape[0]):
@@ -99,7 +122,7 @@ def update_plot(frame):
         mid_time = time_segment[len(time_segment) // 2]
         circle_radius_x = 0.05 * (data.max() - data.min())
         circle_radius_y = 0.1 * (data.max() - data.min())
-        ax.add_patch(plt.Circle((mid_time, 0), circle_radius_x, color=circle_color, alpha=0.5))
+        ax.add_patch(plt.Circle((mid_time, 0), circle_radius_x, color='green', alpha=0.5))
 
         ax.set_title('EEG Real-time Visualizer')
         ax.set_xlabel('Time (s)')
@@ -112,39 +135,29 @@ def update_plot(frame):
         print("End of data reached. Stopping visualization.")
         ani.event_source.stop()
 
-# Function to handle mouse click
+# Function to handle mouse click (for pausing)
 def on_click(event):
     global paused
     paused = not paused
     if not paused:
         ani.event_source.start()
 
-# Function to update the feedback window and log artifacts
-def update_feedback_window(segment, circle_color, time_segment, artifact_detected):
-    global feedback_canvas, feedback_circle, feedback_log
+# Function to update the theta window with a circle based on the scaled theta value, log raw theta values
+def update_theta_window(scaled_theta, circle_color, max_theta, theta_activity):
+    global theta_canvas, theta_circle, theta_log
 
-    # Normalize the segment for display
-    signal = segment[0]  # Assuming we display the first channel
-    normalized_segment = (signal - np.min(signal)) / (np.max(signal) - np.min(signal))
-    normalized_segment = (normalized_segment * 100)  # Scale to fit inside the circle
+    # Calculate the new circle size based on the scaled theta value
+    circle_radius = 50 + 150 * scaled_theta  # Size between 50 and 200
 
-    feedback_canvas.delete("waveform")  # Clear previous waveforms
+    # Update the circle's size
+    theta_canvas.coords(theta_circle, 150 - circle_radius/2, 150 - circle_radius/2, 150 + circle_radius/2, 150 + circle_radius/2)
+    theta_canvas.itemconfig(theta_circle, fill=circle_color)
 
-    # Draw the waveform inside the circle
-    for i in range(len(normalized_segment) - 1):
-        x1 = 150 + (i - len(normalized_segment) // 2)
-        y1 = 150 - normalized_segment[i]  # Invert y-axis to fit the circle
-        x2 = 150 + (i + 1 - len(normalized_segment) // 2)
-        y2 = 150 - normalized_segment[i + 1]
-        feedback_canvas.create_line(x1, y1, x2, y2, fill="blue", tags="waveform")
-
-    # Update circle color based on artifact detection
-    feedback_canvas.itemconfig(feedback_circle, fill=circle_color)
-
-    # Log the artifact in the feedback log
-    if artifact_detected:
-        feedback_log.insert(tk.END, f"Artifact detected at {time_segment[0]:.2f} s\n")
-        feedback_log.see(tk.END)  # Scroll to the latest log
+    # Log the raw and normalized theta activity
+    theta_log.delete(1.0, tk.END)  # Clear previous log
+    theta_log.insert(tk.END, f"Max Theta (raw): {max_theta:.2f}\n")
+    theta_log.insert(tk.END, f"Normalized Theta: {scaled_theta:.2f}\n")
+    theta_log.see(tk.END)  # Scroll to the latest log
 
 # Setup for the feedback window
 root = tk.Tk()
@@ -159,6 +172,19 @@ feedback_circle = feedback_canvas.create_oval(100, 100, 200, 200, outline="black
 # Set up a text widget for artifact logging
 feedback_log = tk.Text(root, width=30, height=20)
 feedback_log.pack(side=tk.RIGHT)
+
+# Setup for the theta window
+theta_window = tk.Toplevel(root)
+theta_window.title("Theta Activity")
+theta_canvas = tk.Canvas(theta_window, width=300, height=300, bg='grey')
+theta_canvas.pack()
+
+# Create the initial theta circle
+theta_circle = theta_canvas.create_oval(100, 100, 200, 200, outline="black", fill="green")
+
+# Set up a text widget for theta activity logging
+theta_log = tk.Text(theta_window, width=30, height=10)
+theta_log.pack()
 
 # Create the plot window
 fig, ax = plt.subplots()
